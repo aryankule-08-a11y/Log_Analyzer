@@ -1,0 +1,13 @@
+2023-10-27 10:00:00 [INFO] System initialized
+2023-10-27 10:00:15 [DEBUG] Component A loaded
+2023-10-27 10:00:30 [DEBUG] Component B loaded
+2023-10-27 10:01:00 [INFO] User login: admin
+2023-10-27 10:05:23 [WARNING] High memory usage detected: 85%
+2023-10-27 10:15:45 [ERROR] Database connection timeout (primary)
+2023-10-27 10:15:50 [INFO] Retrying connection to secondary db
+2023-10-27 10:16:00 [INFO] Connection established to secondary db
+2023-10-27 10:30:00 [WARNING] Deprecated API usage detected in module X
+2023-10-27 11:00:00 [ERROR] Critical payment gateway failure: 500
+2023-10-27 11:05:00 [INFO] User logout: admin
+2023-10-27 12:00:00 [INFO] Scheduled maintenance task started
+2023-10-27 12:05:00 [INFO] Task completed successfully
