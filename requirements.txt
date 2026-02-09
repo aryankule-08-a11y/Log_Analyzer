@@ -1,0 +1,21 @@
+# Log Analyzer Dashboard - Dependencies
+# =====================================
+# Install with: pip install -r requirements.txt
+
+# Core Framework
+streamlit>=1.28.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+plotly>=5.18.0
+matplotlib>=3.7.0
+
+# Data Profiling (optional - install if compatible with your Python version)
+# ydata-profiling>=4.5.0  # Requires Python <3.14
+# sweetviz>=2.3.0  # Alternative profiling library
+
+# Note: The app will work without profiling libraries
+# It will generate a custom HTML report instead
