@@ -1,6 +1,43 @@
+# Python
 __pycache__/
-*.pyc
-.DS_Store
-.env
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
 venv/
+.venv/
+env/
+
+# Data files (can be large — download separately, see README)
+data/raw/
+data/processed/
+*.log
+*.log.gz
+*.parquet
+
+# Outputs (generated at runtime)
+outputs/
+
+# IDE / OS
 .vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Pytest cache
+.pytest_cache/
+.coverage
+htmlcov/

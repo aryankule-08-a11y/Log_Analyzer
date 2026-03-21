@@ -1,296 +1,314 @@
-# Required Dependencies: streamlit, pandas, plotly
-# Run: streamlit run app.py
+"""
+app.py — Streamlit Dashboard (Thin UI Layer)
+--------------------------------------------
+This file ONLY handles UI rendering.
+All business logic lives in src/ modules.
 
+This is the correct separation of concerns:
+  src/parser.py    → Data ingestion
+  src/analyzer.py  → Analysis & feature engineering
+  src/anomaly.py   → ML-based anomaly detection
+  src/visualizer.py → Chart generation
+  app.py           → UI wiring only
+"""
+
+import logging
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import re
-from datetime import datetime
-import io
-import time
+from pathlib import Path
+import tempfile, os
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Log Analyzer Pro",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from src.parser    import parse_log_file, save_parquet
+from src.analyzer  import (
+    add_features, get_summary_stats, get_status_distribution,
+    get_hourly_traffic, get_top_ips, detect_traffic_anomalies,
+    detect_brute_force, get_top_404_paths, get_bandwidth_usage,
+    get_error_summary
+)
+from src.anomaly   import run_isolation_forest, detect_iqr_outliers
+from src.visualizer import (
+    plot_status_distribution, plot_hourly_traffic, plot_top_ips,
+    plot_error_heatmap, plot_anomalies, plot_top_404_paths,
+    plot_bot_vs_human, plot_brute_force_timeline
 )
 
-# --- Custom Styling (CSS) ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("log_analyzer.app")
+
+
+# ─── Page Config ──────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="Log Analyzer | Apache Intelligence Platform",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ─── CSS ──────────────────────────────────────────────────────────────────────
+
 st.markdown("""
-    <style>
-    .main {
-        background-color: #f8f9fa;
-    }
-    .stApp.dark-theme .main {
-        background-color: #0e1117;
-    }
-    h1, h2, h3 {
-        font-family: 'Inter', sans-serif;
-        font-weight: 600;
-    }
-    .metric-card {
-        background-color: white;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        text-align: center;
-    }
-    .stDataFrame {
-        border-radius: 10px;
-        overflow: hidden;
-    }
-    /* Hide Streamlit default hamburger and footer for cleaner look */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    </style>
-    """, unsafe_allow_html=True)
+<style>
+  /* Dark background */
+  .stApp { background-color: #0d1117; }
 
-# --- Helper Functions ---
+  /* Metric cards */
+  [data-testid="metric-container"] {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+  }
 
-@st.cache_data
-def load_data(file):
-    """
-    Parses the uploaded log file and returns a DataFrame.
-    Supports CSV (pre-parsed) or raw text logs (.log, .txt).
-    """
-    if file.name.endswith('.csv'):
-        try:
-            df = pd.read_csv(file)
-            # Ensure required columns exist, roughly
-            if 'timestamp' not in df.columns:
-                # Try to auto-detect or rename
-                pass
-            return df
-        except Exception as e:
-            st.error(f"Error reading CSV: {e}")
-            return None
-    
-    # Text parsing logic
-    content = file.getvalue().decode("utf-8")
-    lines = content.split('\n')
-    
-    parsed_data = []
-    
-    # Generic Log Pattern Regex
-    # Matches: Timestamp (various formats) | Level (various) | Message
-    # Example: 2023-10-25 14:30:00 [INFO] Connection established
-    log_pattern = re.compile(
-        r'(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*[:|-]?\s*'  # Timestamp
-        r'(?:\[(?P<level_bracket>[A-Z]+)\]|(?P<level_no_bracket>[A-Z]+))\s*[:|-]?\s*'      # Level
-        r'(?P<message>.*)'                                                                  # Message
+  /* Sidebar */
+  [data-testid="stSidebar"] { background-color: #161b22; }
+
+  /* Section headers */
+  h2, h3 { color: #58a6ff !important; }
+
+  /* Alert boxes */
+  .alert-box {
+      background: #1f1f2e;
+      border-left: 4px solid #e74c3c;
+      padding: 12px 16px;
+      border-radius: 4px;
+      margin: 8px 0;
+  }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.title("🔍 Log Analyzer")
+    st.caption("Apache Intelligence Platform v2.0")
+    st.divider()
+
+    uploaded_file = st.file_uploader(
+        "Upload Apache Log File",
+        type=['log', 'txt', 'gz'],
+        help="Supports Apache Combined Log Format (.log, .log.gz)"
     )
 
-    for line in lines:
-        if not line.strip():
-            continue
-            
-        match = log_pattern.search(line)
-        if match:
-            data = match.groupdict()
-            level = data.get('level_bracket') or data.get('level_no_bracket')
-            parsed_data.append({
-                'timestamp': data['timestamp'],
-                'level': level,
-                'message': data['message'].strip()
-            })
-        else:
-            # Handle non-matching lines (maybe multiline errors or header)
-            # For now, we skip or add to previous valid log as continuation
-            pass
+    st.divider()
+    st.subheader("⚙️ Detection Settings")
+    z_threshold  = st.slider("Z-Score Threshold (Anomaly)", 1.0, 5.0, 3.0, 0.5)
+    bf_window    = st.slider("Brute-Force Window (min)", 1, 30, 5)
+    bf_threshold = st.slider("Brute-Force Threshold (failures)", 5, 100, 20)
 
-    if not parsed_data:
-         # Fallback: Create simple line-based DF if regex fails completely
-         return pd.DataFrame({'raw_log': lines})
+    st.divider()
+    st.caption("💡 No log file? Download the [NASA HTTP dataset](https://www.kaggle.com/datasets/shawon10/web-log-dataset) to test.")
 
-    df = pd.DataFrame(parsed_data)
-    
-    # Standardize Timestamp
+
+# ─── Main Content ─────────────────────────────────────────────────────────────
+
+st.title("🔍 Apache Log Intelligence Platform")
+st.markdown("**Enterprise-grade log parsing, anomaly detection, and security analysis.**")
+
+if uploaded_file is None:
+    st.info("👈 Upload an Apache `.log` file from the sidebar to begin analysis.")
+    st.markdown("""
+    ### Expected Log Format
+    ```
+    192.168.1.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /index.html HTTP/1.0" 200 2326 "http://ref.com/" "Mozilla/5.0"
+    ```
+    This is the standard **Apache Combined Log Format** used by virtually all Apache and Nginx servers.
+
+    **Get real data:**
+    - [NASA HTTP Logs (Kaggle)](https://www.kaggle.com/datasets/shawon10/web-log-dataset)
+    - [Web Server Access Logs (Kaggle)](https://www.kaggle.com/datasets/eliasdabbas/web-server-access-log)
+    """)
+    st.stop()
+
+
+# ─── Parse Log File ───────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner="Parsing log file...")
+def load_and_parse(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Parse uploaded file — cached so re-renders don't re-parse."""
+    suffix = Path(filename).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
     try:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    except Exception:
-        pass 
+        df = parse_log_file(tmp_path)
+        df = add_features(df)
+    finally:
+        os.unlink(tmp_path)
+
     return df
 
-def convert_df(df):
-    """
-    Converts DataFrame to CSV for download.
-    """
-    return df.to_csv(index=False).encode('utf-8')
 
-# --- Main App Layout ---
+try:
+    df = load_and_parse(uploaded_file.read(), uploaded_file.name)
+except Exception as e:
+    st.error(f"❌ Failed to parse log file: {e}")
+    st.markdown("**Ensure the file uses Apache Combined Log Format.** Check the sidebar for an example.")
+    st.stop()
 
-def main():
-    # Sidebar
-    st.sidebar.title("Settings & Input")
-    
-    # File Upload
-    uploaded_file = st.sidebar.file_uploader("Upload Log File", type=['log', 'txt', 'csv'])
-    
-    # App Info / Settings
-    with st.sidebar.expander("About & Settings", expanded=True):
-        st.info("Supported formats: .log, .txt, .csv")
-        st.markdown("Use standard log formats: `YYYY-MM-DD HH:MM:SS [LEVEL] Message`")
-        if st.checkbox("Enable Antigravity Mode"):
-            try:
-                import antigravity
-            except ImportError:
-                st.warning("Antigravity module not found.")
-        
-    if not uploaded_file:
-        # Landing Page State
-        st.title("📂 Log Analyzer Pro")
-        st.markdown("### Welcome! Upload a log file to generate insights.")
-        st.stop()
 
-    # Process File
-    with st.spinner('Parsing logs...'):
-        # Simulate slight delay for UX (loading spinner visibility)
-        time.sleep(0.5)
-        df = load_data(uploaded_file)
+# ─── KPI Summary Cards ────────────────────────────────────────────────────────
 
-    if df is None or df.empty:
-        st.error("Could not parse file or file is empty.")
-        st.stop()
-        
-    # Data Preprocessing
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        min_date = df['timestamp'].min()
-        max_date = df['timestamp'].max()
-    
-    # --- Sidebar Filters ---
-    st.sidebar.subheader("Filters")
-    
-    # Date Range Filter
-    if 'timestamp' in df.columns and not df['timestamp'].isnull().all():
-        start_date, end_date = st.sidebar.date_input(
-            "Date Range",
-            [min_date.date(), max_date.date()]
-        )
-        # Filter by date
-        df = df[(df['timestamp'].dt.date >= start_date) & (df['timestamp'].dt.date <= end_date)]
+st.subheader("📊 Summary")
+stats = get_summary_stats(df)
 
-    # Level Filter
-    if 'level' in df.columns:
-        all_levels = df['level'].unique().tolist()
-        selected_levels = st.sidebar.multiselect("Log Levels", all_levels, default=all_levels)
-        df = df[df['level'].isin(selected_levels)]
-        
-    # Search Filter
-    search_term = st.sidebar.text_input("Heuristic Search (Keyword)", "")
-    if search_term and 'message' in df.columns:
-        df = df[df['message'].str.contains(search_term, case=False, na=False)]
+cols = st.columns(4)
+kpi_map = [
+    ("Total Requests",  f"{stats['total_requests']:,}",        "📥"),
+    ("Unique IPs",      f"{stats['unique_ips']:,}",            "🌐"),
+    ("Error Rate",      stats['error_rate'],                    "❌"),
+    ("Bot Traffic",     stats['bot_traffic_pct'],               "🤖"),
+]
+for col, (label, value, icon) in zip(cols, kpi_map):
+    col.metric(f"{icon} {label}", value)
 
-    # --- Dashboard View ---
-    
-    st.title("📊 Log Analysis Dashboard")
-    st.markdown("---")
-    
-    # Quick Metrics
-    total_logs = len(df)
-    
-    col1, col2, col3, col4 = st.columns(4)
+cols2 = st.columns(4)
+kpi_map2 = [
+    ("Date Range",      f"{stats['date_range_days']} days",    "📅"),
+    ("Server Errors",   f"{stats['server_errors']:,}",         "🔥"),
+    ("Total Bandwidth", stats['total_bytes_gb'],                "💾"),
+    ("Top Status",      f"HTTP {stats['top_status']}",         "✅"),
+]
+for col, (label, value, icon) in zip(cols2, kpi_map2):
+    col.metric(f"{icon} {label}", value)
+
+
+# ─── Navigation Tabs ──────────────────────────────────────────────────────────
+
+tab_traffic, tab_errors, tab_security, tab_anomaly, tab_raw = st.tabs([
+    "📈 Traffic", "🚨 Errors", "🔐 Security", "🧠 Anomaly Detection", "🗂️ Raw Data"
+])
+
+
+# ────────────────────────── TAB 1: TRAFFIC ────────────────────────────────────
+with tab_traffic:
+    st.subheader("Request Volume Over Time")
+    hourly = get_hourly_traffic(df)
+    st.plotly_chart(plot_hourly_traffic(hourly), use_container_width=True)
+
+    col1, col2 = st.columns(2)
     with col1:
-        st.metric("Total Logs", total_logs)
-    
-    if 'level' in df.columns:
-        error_count = len(df[df['level'] == 'ERROR'])
-        warning_count = len(df[df['level'] == 'WARNING'])
-        info_count = len(df[df['level'] == 'INFO'])
-        
-        with col2:
-            st.metric("Errors", error_count, delta_color="inverse")
-        with col3:
-            st.metric("Warnings", warning_count, delta_color="normal")
-        with col4:
-            st.metric("Info/Other", info_count)
+        st.subheader("Top IP Addresses")
+        top_ips = get_top_ips(df, n=15)
+        st.plotly_chart(plot_top_ips(top_ips), use_container_width=True)
+    with col2:
+        st.subheader("Bot vs Human Traffic")
+        st.plotly_chart(plot_bot_vs_human(df), use_container_width=True)
 
-    st.markdown("---")
+    st.subheader("Bandwidth Usage by Endpoint")
+    bw = get_bandwidth_usage(df)
+    st.dataframe(bw, use_container_width=True, hide_index=True)
 
-    # --- Charts Section ---
-    
-    if 'level' in df.columns:
-        c1, c2 = st.columns(2)
-        
-        with c1:
-            st.subheader("Log Level Distribution")
-            fig_pie = px.pie(df, names='level', hole=0.4, title="Distribution of Log Levels")
-            fig_pie.update_traces(textinfo='percent+label')
-            st.plotly_chart(fig_pie, use_container_width=True)
-            
-        with c2:
-             if 'timestamp' in df.columns:
-                st.subheader("Log Volume Over Time")
-                # Resample by hour or day depending on range
-                time_df = df.set_index('timestamp').resample('H').size().reset_index(name='count')
-                fig_line = px.line(time_df, x='timestamp', y='count', title="Logs per Hour", markers=True)
-                fig_line.update_layout(xaxis_title="Time", yaxis_title="Count")
-                st.plotly_chart(fig_line, use_container_width=True)
 
-    # Heatmap (if timestamp exists)
-    if 'timestamp' in df.columns:
-        st.subheader("Activity Heatmap (Hour vs Day)")
-        df['hour'] = df['timestamp'].dt.hour
-        df['day'] = df['timestamp'].dt.day_name()
-        heatmap_data = df.groupby(['day', 'hour']).size().reset_index(name='count')
-        
-        fig_heat = px.density_heatmap(
-            heatmap_data, 
-            x='hour', 
-            y='day', 
-            z='count', 
-            nbinsx=24, 
-            title="Log Density by Day & Hour",
-            color_continuous_scale='Virid'
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
+# ────────────────────────── TAB 2: ERRORS ─────────────────────────────────────
+with tab_errors:
+    st.subheader("HTTP Status Code Distribution")
+    status_df = get_status_distribution(df)
+    st.plotly_chart(plot_status_distribution(status_df), use_container_width=True)
 
-    # Top Errors
-    if 'level' in df.columns and 'message' in df.columns:
-        st.subheader("Top Frequent Errors")
-        error_df = df[df['level'] == 'ERROR']
-        if not error_df.empty:
-            top_errors = error_df['message'].value_counts().head(10).reset_index()
-            top_errors.columns = ['Message', 'Count']
-            
-            fig_bar = px.bar(
-                top_errors, 
-                x='Count', 
-                y='Message', 
-                orientation='h', 
-                title="Top 10 Error Messages",
-                color='Count'
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Error Rate Heatmap (Day × Hour)")
+        st.plotly_chart(plot_error_heatmap(df), use_container_width=True)
+    with col2:
+        st.subheader("Top 404 Paths (Scanner Detection)")
+        paths_404 = get_top_404_paths(df, n=10)
+        st.plotly_chart(plot_top_404_paths(paths_404), use_container_width=True)
+
+    st.subheader("Full Error Breakdown")
+    error_summary = get_error_summary(df)
+    st.dataframe(error_summary.head(50), use_container_width=True, hide_index=True)
+
+
+# ────────────────────────── TAB 3: SECURITY ───────────────────────────────────
+with tab_security:
+    st.subheader("🔐 Authentication Failure Analysis")
+    st.plotly_chart(plot_brute_force_timeline(df), use_container_width=True)
+
+    st.subheader(f"Brute-Force Detection (≥{bf_threshold} failures in {bf_window}min)")
+    bf_result = detect_brute_force(df, window_minutes=bf_window, threshold=bf_threshold)
+
+    if bf_result.empty:
+        st.success("✅ No brute-force patterns detected with current settings.")
+    else:
+        st.error(f"⚠️ {len(bf_result)} suspicious IP(s) detected!")
+        for _, row in bf_result.iterrows():
+            st.markdown(
+                f'<div class="alert-box">🚨 <b>{row["ip"]}</b> — '
+                f'{row["failures_in_window"]} failures in {bf_window}m window '
+                f'| Last attempt: {row["window_end"]}</div>',
+                unsafe_allow_html=True
             )
-            fig_bar.update_layout(yaxis={'categoryorder': 'total ascending'})
-            st.plotly_chart(fig_bar, use_container_width=True)
+        st.dataframe(bf_result, use_container_width=True, hide_index=True)
+
+
+# ────────────────────────── TAB 4: ANOMALY DETECTION ──────────────────────────
+with tab_anomaly:
+    st.subheader(f"📡 Traffic Anomaly Detection (Z-Score ≥ {z_threshold})")
+
+    anomalies = detect_traffic_anomalies(df, z_threshold=z_threshold)
+    st.plotly_chart(plot_anomalies(anomalies, hourly), use_container_width=True)
+
+    if anomalies.empty:
+        st.success("✅ No statistical anomalies at current threshold.")
+    else:
+        st.warning(f"⚠️ {len(anomalies)} anomalous IP-window combinations detected.")
+        st.dataframe(anomalies, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("🤖 Isolation Forest — Behavioral Anomaly Detection")
+    st.caption(
+        "Uses machine learning to flag IPs with abnormal behavioral patterns "
+        "(volume, error rate, path diversity, bot signals) — not just raw request count."
+    )
+
+    if st.button("Run Isolation Forest", type="primary"):
+        with st.spinner("Training Isolation Forest on IP behavior features..."):
+            if_result = run_isolation_forest(df, contamination=0.05)
+
+        if if_result.empty:
+            st.warning("Insufficient data for Isolation Forest (need ≥10 unique IPs).")
         else:
-            st.info("No errors found in the filtered selection.")
+            flagged = if_result[if_result['is_anomaly']]
+            st.error(f"🚨 {len(flagged)} IPs flagged as behaviorally anomalous")
+            st.dataframe(if_result, use_container_width=True, hide_index=True)
 
-    # --- Data Table Section ---
-    st.markdown("---")
-    st.subheader("📋 Detailed Log View")
-    
-    st.dataframe(
-        df, 
-        use_container_width=True, 
-        height=400,
-        column_config={
-            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="D MMM YYYY, h:mm a"),
-        }
-    )
-    
-    # Export
-    csv = convert_df(df)
-    st.download_button(
-        label="📥 Download Filtered Logs (CSV)",
-        data=csv,
-        file_name='filtered_logs.csv',
-        mime='text/csv',
-    )
+            csv = if_result.to_csv(index=False)
+            st.download_button(
+                "📥 Download Anomaly Report (CSV)",
+                csv,
+                file_name="anomaly_report.csv",
+                mime="text/csv"
+            )
 
 
-if __name__ == "__main__":
-    main()
+# ────────────────────────── TAB 5: RAW DATA ───────────────────────────────────
+with tab_raw:
+    st.subheader("Parsed Log Data")
+    st.caption(f"{len(df):,} rows | {df.columns.tolist()}")
+    st.dataframe(df.head(500), use_container_width=True, hide_index=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        csv_data = df.to_csv(index=False)
+        st.download_button("📥 Export as CSV", csv_data, "parsed_logs.csv", "text/csv")
+    with col2:
+        st.download_button(
+            "📥 Export as Parquet",
+            df.to_parquet(index=False),
+            "parsed_logs.parquet",
+            "application/octet-stream"
+        )
+
+    st.subheader("DataFrame Info")
+    info_df = pd.DataFrame({
+        'Column':    df.columns,
+        'Dtype':     [str(d) for d in df.dtypes],
+        'Non-Null':  df.notna().sum().values,
+        'Null':      df.isna().sum().values,
+        'Null %':    (df.isna().mean() * 100).round(2).values,
+    })
+    st.dataframe(info_df, use_container_width=True, hide_index=True)
